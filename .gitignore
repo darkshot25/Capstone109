@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Custom additions for RPi Vision Project
+*.h264       # Raw video from Pi Camera
+*.mp4        # Converted videos
+.env         # If you use environment variables for your IoT server IP
