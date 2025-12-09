@@ -1,321 +1,344 @@
+import cv2
+import cv2.aruco as aruco
+import numpy as np
+import RPi.GPIO as GPIO
 import time
-import sys
-import random
-import statistics
+import requests
+import math
+import board
+import busio
+import adafruit_vl53l0x
+from RPLCD.i2c import CharLCD
+from datetime import datetime
+import threading
 
-# --- CONFIGURATION ---
-# GPIO Pin Mapping (BCM Mode)
-PINS = {
-    "BTN_SPEED": 17,
-    "BTN_PATH": 27,
-    "BTN_BRAKE": 22,
-    "BTN_EBRAKE": 10
-}
+# ==========================================
+# CONFIGURATION
+# ==========================================
 
-#Servo Configuration
+# IoT Server Configuration
+IOT_SERVER_URL = "http://your-iot-server-ip:port/endpoint"  # REPLACE THIS
+DEVICE_ID = "AMR_TEST_RIG_01"
+
+# GPIO Pins (BCM Mode)
+BTN_SPEED = 17
+BTN_PATH = 27
+BTN_EMERGENCY = 22
+BTN_BRAKE = 10
 SERVO_PIN = 18
-OBSTACLE_DOWN_ANGLE = 90
-OBSTACLE_UP_ANGLE = 0
 
-#ToF stop threshhold
-STOP_VARIANCE_LIMIT = 5.0  # If readings vary less than 5mm, robot is stopped
-STOP_CHECK_WINDOW = 5      # How many readings to check for stability
+# Servo Settings
+SERVO_FREQ = 50 # 50Hz pulse
+SERVO_OPEN_DC = 2.5  # Duty Cycle for 0 degrees (Adjust for your servo)
+SERVO_CLOSE_DC = 7.5 # Duty Cycle for 90 degrees
 
+# Camera Settings
+CAM_WIDTH = 640
+CAM_HEIGHT = 480
+PIXELS_PER_METER = 350.0  # CALIBRATION REQUIRED: How many pixels equal 1 meter?
 
-# --- MOCK CLASSES (For PC Simulation) ---
-#Comment this block when run on Raspberry Pi
+# AruCo Marker IDs
+ID_ROBOT = 1
+ID_PATH_REF = 2
+ID_S1 = 3
+ID_S2 = 4
 
-class MockVL53L0X:
-    """Simulates a ToF sensor seeing a robot approach and stop."""
-    def __init__(self):
-        self.current_distance = 1500  # Start at 1.5m
-        self.is_moving = False
-        self.start_time = 0
-        
-    def start_simulation(self):
-        self.is_moving = True
-        self.start_time = time.time()
-        self.current_distance = 1500
+# Thresholds
+SPEED_MIN = 1.0
+SPEED_MAX = 2.0
+PATH_MAX_DEVIATION = 15.0 # Degrees
+EMERGENCY_TIME_LIMIT = 5.0 # Seconds
 
-    def range(self):
-        """Returns distance in mm."""
-        if not self.is_moving:
-            return 1500 + random.randint(-2, 2) # Idle noise
-        
-        elapsed = time.time() - self.start_time
-        
-        # Simulate Robot Physics:
-        # Move fast for 1.5 seconds, then decelerate, then stop at 2.0s
-        if elapsed < 1.0:
-            self.current_distance -= 40 # Moving fast
-        elif elapsed < 2.0:
-            self.current_distance -= 10 # Braking hard
-        else:
-            # Robot stopped, but sensor has noise (+/- 2mm)
-            return 400 + random.randint(-2, 2) 
-            
-        return max(0, self.current_distance)
+# ==========================================
+# HARDWARE INITIALIZATION
+# ==========================================
 
-# --- HARDWARE ABSTRACTION LAYER ---
-# This block detects if we are on a Pi or PC and sets up the environment accordingly.
+# GPIO Setup
+GPIO.setmode(GPIO.BCM)
+GPIO.setup([BTN_SPEED, BTN_PATH, BTN_EMERGENCY, BTN_BRAKE], GPIO.IN, pull_up_down=GPIO.PUD_UP)
+GPIO.setup(SERVO_PIN, GPIO.OUT)
 
-IS_RPI = False
-tof_sensor = None
-pwm_servo = None
+# Servo PWM
+pwm_servo = GPIO.PWM(SERVO_PIN, SERVO_FREQ)
+pwm_servo.start(0)
 
+# I2C Setup (LCD and ToF share the bus)
 try:
-    import RPi.GPIO as GPIO # type: ignore
-    import board            # type: ignore
-    import busio            # type: ignore
-    import adafruit_vl53l0x # type: ignore
-    # If this succeeds, we are on the Pi
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
+    # Initialize LCD (Address usually 0x27)
+    lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
+    lcd.clear()
     
-    # Setup Buttons with Internal Pull-Up Resistors
-    # (Default High, goes Low when pressed)
-    for name, pin in PINS.items():
-        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        
-    IS_RPI = True
-    print("[SYSTEM] Hardware detected: Raspberry Pi GPIO Active")
-
-    # Setup ToF (I2C)
+    # Initialize ToF Sensor
     i2c = busio.I2C(board.SCL, board.SDA)
-    tof_sensor = adafruit_vl53l0x.VL53L0X(i2c)
-
-    # Setup Servo
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(SERVO_PIN, GPIO.OUT)
-    pwm_servo = GPIO.PWM(SERVO_PIN, 50) # 50Hz
-    pwm_servo.start(0)
-
-except ImportError:
-    # If this fails, we are on PC
-    print("[SYSTEM] Hardware not detected: Running in SIMULATION MODE")
-    tof_sensor = MockVL53L0X()
-    IS_RPI = False
-
+    tof = adafruit_vl53l0x.VL53L0X(i2c)
 except Exception as e:
-    print(f"[SYSTEM] Hardware Error: {e}")
-    tof_sensor = MockVL53L0X()
+    print(f"I2C Init Error: {e}")
 
-# --- LCD CLASS DEFINITION ---
-class SystemDisplay:
-    def __init__(self):
-        self.line1 = ""
-        self.line2 = ""
-        if IS_RPI:
-            # Here you would initialize the real I2C LCD library
-            # e.g., self.lcd = I2cCharDisplay(...)
-            pass 
+# Camera Setup
+cap = cv2.VideoCapture(0)
+cap.set(3, CAM_WIDTH)
+cap.set(4, CAM_HEIGHT)
 
-    def update(self, line1_text, line2_text=""):
-        """Updates the display content"""
-        self.line1 = line1_text
-        self.line2 = line2_text
-        
-        if IS_RPI:
-            # Code to send text to real I2C LCD
-            # self.lcd.write_string(line1_text)
-            pass
-        
-        # Always print to console for debugging/simulation
-        self.print_simulation()
+# AruCo Setup
+aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+aruco_params = aruco.DetectorParameters()
 
-    def print_simulation(self):
-        """Draws a fake LCD on the terminal"""
-        print("\n" + "="*20)
-        print(f"| {self.line1.center(16)} |")
-        print(f"| {self.line2.center(16)} |")
-        print("="*20 + "\n")
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 
-# --- TEST MODE FUNCTIONS ---
-# These are the specific functions the code "goes to" when a button is pressed
+def display_lcd(line1, line2=""):
+    """Writes text to LCD."""
+    lcd.clear()
+    lcd.write_string(line1)
+    lcd.crlf()
+    lcd.write_string(line2)
+    print(f"[LCD] {line1} | {line2}")
 
-def set_servo_angle(angle):
-    if IS_RPI:
-        # Map 0-180 degrees to 2.5-12.5 duty cycle
-        duty = 2.5 + (angle / 18.0)
-        pwm_servo.ChangeDutyCycle(duty)
-        time.sleep(0.3) # Wait for movement
-        pwm_servo.ChangeDutyCycle(0) # Stop jitter
-    else:
-        print(f"[SERVO] Moving to {angle} degrees")
+def set_servo(angle):
+    """0 = Open, 90 = Obstacle."""
+    dc = SERVO_OPEN_DC if angle == 0 else SERVO_CLOSE_DC
+    pwm_servo.ChangeDutyCycle(dc)
+    time.sleep(0.5)
+    pwm_servo.ChangeDutyCycle(0) # Stop jitter
 
-def get_distance():
-    if IS_RPI:
-        return tof_sensor.range
-    else:
-        return tof_sensor.range()
+def send_data(test_name, result_data, status):
+    """Sends JSON data to server."""
+    payload = {
+        "session_id": f"{test_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "timestamp": datetime.now().isoformat(),
+        "data": result_data,
+        "status": status
+    }
+    try:
+        # response = requests.post(IOT_SERVER_URL, json=payload, timeout=2) # Uncomment for real server
+        print(f"Uploading: {payload}")
+    except Exception as e:
+        print(f"Upload Failed: {e}")
 
-def run_speed_test():
-    display.update("Mode Selected:", "SPEED TEST")
-    print(">>> [LOGIC] Initializing Camera...")
-    print(">>> [LOGIC] Looking for QR Code...")
-    time.sleep(1) # Simulate setup time
-    print(">>> [LOGIC] Calculating Displacement...")
-    # Add your Speed Test Logic here later
+def get_aruco_positions(frame):
+    """Returns a dict of found AruCo IDs and their centers (x, y)."""
+    corners, ids, _ = aruco.detectMarkers(frame, aruco_dict, parameters=aruco_params)
+    positions = {}
+    if ids is not None:
+        ids = ids.flatten()
+        for (marker_corner, marker_id) in zip(corners, ids):
+            corners = marker_corner.reshape((4, 2))
+            (topLeft, topRight, bottomRight, bottomLeft) = corners
+            cX = int((topLeft[0] + bottomRight[0]) / 2.0)
+            cY = int((topLeft[1] + bottomRight[1]) / 2.0)
+            positions[marker_id] = (cX, cY)
+    return positions
 
-def run_path_accuracy_test():
-    display.update("Mode Selected:", "PATH ACCURACY")
-    print(">>> [LOGIC] Calibrating Center Line...")
-    print(">>> [LOGIC] Tracking Robot Deviation...")
-    time.sleep(1)
-    # Add your Path Logic here later
+# ==========================================
+# TEST LOGIC FUNCTIONS
+# ==========================================
 
-def run_brake_test():
-    display.update("Mode Selected:", "NORMAL BRAKE")
-    print(">>> [LOGIC] Waiting for Trigger S1...")
-    time.sleep(1)
-    # Add your Brake Logic here later
-
-def run_emergency_brake_test(display_handler = None):
-    """
-    Executes the full Emergency Brake Test cycle.
-    Args:
-        display_handler: The display object from your main code to show status.
-    """
-    if display_handler is None:
-        class ConsoleDisplay:
-            def update(self, l1, l2): print(f"[LCD-SIM] {l1} | {l2}")
-        display_handler = ConsoleDisplay()
-    display_handler.update("TEST: E-BRAKE", "Status: Idle")
+def test_speed():
+    display_lcd("Speed Test", "Ready...")
+    time.sleep(2)
     
-    # 1. Reset System
-    print("\n--- STARTING EMERGENCY BRAKE TEST ---")
-    set_servo_angle(OBSTACLE_UP_ANGLE)
-    time.sleep(1)
-    
-    # 2. Random Interval Wait (Simulate robot moving normally)
-    wait_time = random.randint(2, 5) # Wait 2 to 5 seconds
-    print(f"Waiting {wait_time}s for robot to reach speed...")
-    
-    for i in range(wait_time, 0, -1):
-        display_handler.update("TEST: E-BRAKE", f"Drop in {i}s...")
-        time.sleep(1)
-        
-    # 3. INTRODUCE OBSTACLE (Trigger)
-    print(">>> TRIGGER: OBSTACLE DOWN! <<<")
-    if not IS_RPI: tof_sensor.start_simulation() # Start mock physics
+    positions_prev = None
+    time_prev = None
+    speeds = []
     
     start_time = time.time()
-    set_servo_angle(OBSTACLE_DOWN_ANGLE)
     
-    # 4. Measure Stopping
-    display_handler.update("TEST: E-BRAKE", "Tracking...")
-    
-    distance_history = []
-    robot_stopped = False
-    final_distance = 0
-    
-    while not robot_stopped:
-        # Read sensor
-        dist = get_distance()
-        current_time = time.time() - start_time
+    # Run test for 5 seconds
+    while time.time() - start_time < 5:
+        ret, frame = cap.read()
+        if not ret: continue
         
-        print(f"Time: {current_time:.2f}s | Dist: {dist}mm")
+        positions = get_aruco_positions(frame)
         
-        # Add to history buffer for stability check
-        distance_history.append(dist)
-        if len(distance_history) > STOP_CHECK_WINDOW:
-            distance_history.pop(0)
+        if ID_ROBOT in positions:
+            curr_pos = positions[ID_ROBOT]
+            curr_time = time.time()
             
-            # CHECK STABILITY: Calculate variance/stdev of last few readings
-            # If the readings aren't changing much, the robot has stopped.
-            if len(distance_history) == STOP_CHECK_WINDOW:
-                variance = statistics.stdev(distance_history)
-                if variance < STOP_VARIANCE_LIMIT:
-                    robot_stopped = True
-                    final_distance = statistics.mean(distance_history)
-        
-        time.sleep(0.1) # Sampling rate (10Hz)
-        
-        # Timeout safety
-        if current_time > 10.0:
-            print("TIMEOUT: Robot did not stop.")
-            break
+            if positions_prev is not None:
+                # Calculate Euclidean distance in pixels
+                dist_px = math.sqrt((curr_pos[0]-positions_prev[0])**2 + (curr_pos[1]-positions_prev[1])**2)
+                dist_m = dist_px / PIXELS_PER_METER
+                dt = curr_time - time_prev
+                
+                if dt > 0:
+                    speed = dist_m / dt
+                    speeds.append(speed)
+                    print(f"Current Speed: {speed:.2f} m/s")
+            
+            positions_prev = curr_pos
+            time_prev = curr_time
 
-    # 5. Calculate Results
-    stop_duration = time.time() - start_time
-    
-    print("\n--- TEST COMPLETE ---")
-    print(f"Stopping Time:    {stop_duration:.2f} seconds")
-    print(f"Stopping Dist:    {final_distance:.0f} mm")
-    
-    display_handler.update("RESULT:", f"{stop_duration:.2f}s / {final_distance:.0f}mm")
-    
-    # 6. Reset
-    time.sleep(3)
-    set_servo_angle(OBSTACLE_UP_ANGLE)
-
-# --- MAIN EXECUTION ---
-
-# Initialize Display
-display = SystemDisplay()
-
-def main_loop():
-    display.update("SYSTEM READY", "SELECT MODE")
-    
-    if IS_RPI:
-        # --- RASPBERRY PI LOOP ---
-        try:
-            while True:
-                # Check Button 1: Speed Test
-                if GPIO.input(PINS["BTN_SPEED"]) == GPIO.LOW:
-                    run_speed_test()
-                    time.sleep(0.5) # Debounce delay
-
-                # Check Button 2: Path Accuracy
-                elif GPIO.input(PINS["BTN_PATH"]) == GPIO.LOW:
-                    run_path_accuracy_test()
-                    time.sleep(0.5)
-
-                # Check Button 3: Brake Test
-                elif GPIO.input(PINS["BTN_BRAKE"]) == GPIO.LOW:
-                    run_brake_test()
-                    time.sleep(0.5)
-
-                # Check Button 4: Emergency Brake
-                elif GPIO.input(PINS["BTN_EBRAKE"]) == GPIO.LOW:
-                    run_emergency_brake_test()
-                    time.sleep(0.5)
-
-                time.sleep(0.1) # Prevent CPU hogging
-
-        except KeyboardInterrupt:
-            print("Exiting...")
-            GPIO.cleanup()
-
+    if len(speeds) > 0:
+        avg_speed = sum(speeds) / len(speeds)
+        status = "Pass" if SPEED_MIN <= avg_speed <= SPEED_MAX else "Fail"
+        display_lcd(f"Spd: {avg_speed:.2f} m/s", status)
+        send_data("Speed_Test", {"speed": avg_speed}, status)
     else:
-        # --- PC SIMULATION LOOP ---
-        while True:
-            print("Simulate Button Press: [1] Speed [2] Path [3] Brake [4] E-Brake [Q] Quit")
-            choice = input("INPUT > ").strip()
+        display_lcd("Error", "No Marker Found")
 
-            if choice == "1":
-                run_speed_test()
-            elif choice == "2":
-                run_path_accuracy_test()
-            elif choice == "3":
-                run_brake_test()
-            elif choice == "4":
-                run_emergency_brake_test()
-            elif choice.upper() == "Q":
-                break
-            else:
-                print("Invalid Button")
+def test_path_accuracy():
+    display_lcd("Path Acc Test", "Finding Refs...")
+    time.sleep(1)
+    
+    ret, frame = cap.read()
+    positions = get_aruco_positions(frame)
+    
+    if ID_ROBOT in positions and ID_PATH_REF in positions:
+        p1 = positions[ID_ROBOT]
+        p2 = positions[ID_PATH_REF] # Middle of track
+        
+        # Calculate angle of line connecting Robot and Ref relative to vertical
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        
+        # Angle in degrees. 0 degrees is strictly vertical movement
+        angle_rad = math.atan2(dx, dy) 
+        angle_deg = math.degrees(angle_rad)
+        deviation = abs(angle_deg)
+        
+        status = "Pass" if deviation < PATH_MAX_DEVIATION else "Fail"
+        
+        display_lcd(f"Dev: {deviation:.1f} deg", status)
+        send_data("Path_Test", {"deviation": deviation}, status)
+    else:
+        display_lcd("Error", "Mkrs Missing")
 
-if __name__ == "__main__":
-    main_loop()
-
-'''
-# --- SELF-TEST BLOCK ---
-if __name__ == "__main__":
-    # Mock display class for testing this file alone
-    class MockDisplay:
-        def update(self, l1, l2): print(f"[LCD] {l1} | {l2}")
+def test_emergency_brake():
+    # Ensure servo is open
+    set_servo(0)
+    display_lcd("Emg Brake Test", "Running...")
+    
+    # Random wait 2 to 5 seconds
+    time.sleep(np.random.uniform(2, 5))
+    
+    # Trigger Obstacle
+    set_servo(90)
+    trigger_time = time.time()
+    
+    # Monitor ToF for stop
+    history = []
+    stop_time = 0
+    robot_stopped = False
+    
+    while not robot_stopped and (time.time() - trigger_time < 10):
+        try:
+            dist = tof.range
+            history.append(dist)
+            if len(history) > 5: history.pop(0)
             
-    # Ensure the function accepts the argument
-    run_emergency_brake_test(MockDisplay())
-'''
+            # Check if distance is constant (variance is low)
+            if len(history) == 5 and max(history) - min(history) < 10: # 10mm tolerance
+                robot_stopped = True
+                stop_time = time.time() - trigger_time
+        except:
+            pass
+        time.sleep(0.1)
+
+    # Reset Servo
+    set_servo(0)
+    
+    if robot_stopped:
+        status = "Pass" if stop_time < EMERGENCY_TIME_LIMIT else "Fail"
+        display_lcd(f"Stop: {stop_time:.2f}s", status)
+        send_data("Emg_Brake", {"stop_time": stop_time}, status)
+    else:
+        display_lcd("Fail", "No Stop Detect")
+        send_data("Emg_Brake", {"stop_time": -1}, "Fail")
+
+def test_brake_zone():
+    display_lcd("Brake Zone Test", "Wait for Stop...")
+    
+    # 1. Capture Reference positions first
+    ret, frame = cap.read()
+    positions = get_aruco_positions(frame)
+    
+    if ID_S1 not in positions or ID_S2 not in positions:
+        display_lcd("Error", "Zones Missing")
+        return
+
+    # Assume S1 is first line (lower Y pixel value if top-down view?), S2 is second
+    # Adjust logic based on your camera orientation.
+    # Here assuming Robot moves from Top of image (low Y) to Bottom (High Y)
+    y_s1 = positions[ID_S1][1]
+    y_s2 = positions[ID_S2][1]
+    
+    # 2. Wait for robot to stop moving
+    last_pos = (0,0)
+    stable_count = 0
+    
+    while stable_count < 10: # wait for 10 frames of no movement
+        ret, frame = cap.read()
+        positions = get_aruco_positions(frame)
+        if ID_ROBOT in positions:
+            curr_pos = positions[ID_ROBOT]
+            dist = math.sqrt((curr_pos[0]-last_pos[0])**2 + (curr_pos[1]-last_pos[1])**2)
+            
+            if dist < 2: # barely moved
+                stable_count += 1
+            else:
+                stable_count = 0
+            last_pos = curr_pos
+        time.sleep(0.1)
+        
+    # 3. Check position
+    robot_y = last_pos[1]
+    
+    # Logic: Start -> S1 -> S2 -> End
+    # Pass if S1 < Robot < S2
+    
+    status = ""
+    res_text = ""
+    
+    if robot_y < y_s1:
+        status = "Fail (Over)" # Stopped too early
+        res_text = "Overbrake"
+    elif robot_y > y_s2:
+        status = "Fail (Under)" # Stopped too late
+        res_text = "Underbrake"
+    else:
+        status = "Pass"
+        res_text = "Good Stop"
+        
+    display_lcd(res_text, status)
+    send_data("Brake_Zone", {"position_y": robot_y, "s1": y_s1, "s2": y_s2}, status)
+
+# ==========================================
+# MAIN LOOP
+# ==========================================
+
+def main():
+    display_lcd("System Ready", "Select Mode")
+    
+    try:
+        while True:
+            if GPIO.input(BTN_SPEED) == GPIO.LOW:
+                test_speed()
+                time.sleep(2)
+                display_lcd("System Ready", "Select Mode")
+                
+            elif GPIO.input(BTN_PATH) == GPIO.LOW:
+                test_path_accuracy()
+                time.sleep(2)
+                display_lcd("System Ready", "Select Mode")
+
+            elif GPIO.input(BTN_EMERGENCY) == GPIO.LOW:
+                test_emergency_brake()
+                time.sleep(2)
+                display_lcd("System Ready", "Select Mode")
+
+            elif GPIO.input(BTN_BRAKE) == GPIO.LOW:
+                test_brake_zone()
+                time.sleep(2)
+                display_lcd("System Ready", "Select Mode")
+                
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        display_lcd("System Off", "")
+        pwm_servo.stop()
+        GPIO.cleanup()
+        cap.release()
+
+if __name__ == "__main__":
+    main()
