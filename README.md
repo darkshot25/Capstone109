@@ -19,7 +19,7 @@ The system is built on a **Raspberry Pi 4 (4GB)** using the following peripheral
 | **Push Buttons** | Test Mode Selection | GPIO |
 
 ### System Sketch
-![System Concept] 'Screenshot 2025-12-09 233341.png'
+![System Concept] ['Screenshot 2025-12-09 233341.png'](https://github.com/darkshot25/Capstone109/blob/689a179ed57650c7e1dcd264cd9064e7a84f62c6/Screenshot%202025-12-09%20233341.png)
 *(Note: Replace `IMG_20251108_010734.jpg` with the actual path to your uploaded image in the repo)*
 
 ## 🧪 Test Scenarios implemented
