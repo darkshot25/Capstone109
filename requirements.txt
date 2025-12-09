@@ -1,0 +1,19 @@
+# Computer Vision & AruCo Markers
+opencv-contrib-python
+
+# GPIO Control (Standard for Pi 4)
+RPi.GPIO
+
+# I2C LCD Display
+RPLCD
+smbus2
+
+# ToF Sensor & CircuitPython Compatibility
+adafruit-circuitpython-vl53l0x
+adafruit-blinka
+
+# IoT / HTTP
+requests
+
+# Scientific Math (Used by OpenCV and your logic)
+numpy
