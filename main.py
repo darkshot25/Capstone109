@@ -1,14 +1,14 @@
 import cv2
 import cv2.aruco as aruco
 import numpy as np
-import RPi.GPIO as GPIO
+import RPi.GPIO as GPIO # type: ignore
 import time
-import requests
+import requests # type: ignore
 import math
-import board
-import busio
-import adafruit_vl53l0x
-from RPLCD.i2c import CharLCD
+import board # type: ignore
+import busio # type: ignore
+import adafruit_vl53l0x # type: ignore
+from RPLCD.i2c import CharLCD # type: ignore
 from datetime import datetime
 import threading
 
@@ -35,7 +35,7 @@ SERVO_CLOSE_DC = 7.5 # Duty Cycle for 90 degrees
 # Camera Settings
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
-PIXELS_PER_METER = 350.0  # CALIBRATION REQUIRED: How many pixels equal 1 meter?
+PIXELS_PER_METER = 642.0  # CALIBRATION REQUIRED: How many pixels equal 1 meter?
 
 # AruCo Marker IDs
 ID_ROBOT = 1
