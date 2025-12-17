@@ -10,14 +10,13 @@ import busio # type: ignore
 import adafruit_vl53l0x # type: ignore
 from RPLCD.i2c import CharLCD # type: ignore
 from datetime import datetime
-import threading
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 
 # IoT Server Configuration
-IOT_SERVER_URL = "http://your-iot-server-ip:port/endpoint"  # REPLACE THIS
+IOT_SERVER_URL = "http://your-iot-server-ip:port/endpoint"
 DEVICE_ID = "AMR_TEST_RIG_01"
 
 # GPIO Pins (BCM Mode)
@@ -28,20 +27,21 @@ BTN_BRAKE = 10
 SERVO_PIN = 18
 
 # Servo Settings
-SERVO_FREQ = 50 # 50Hz pulse
-SERVO_OPEN_DC = 2.5  # Duty Cycle for 0 degrees (Adjust for your servo)
-SERVO_CLOSE_DC = 7.5 # Duty Cycle for 90 degrees
+SERVO_FREQ = 50 
+SERVO_OPEN_DC = 2.5  
+SERVO_CLOSE_DC = 7.5 
 
 # Camera Settings
 CAM_WIDTH = 640
 CAM_HEIGHT = 480
-PIXELS_PER_METER = 642.0  # CALIBRATION REQUIRED: How many pixels equal 1 meter?
+# UPDATED: Set to the value you found during calibration
+PIXELS_PER_METER = 642.0  
 
 # AruCo Marker IDs
 ID_ROBOT = 1
-ID_PATH_REF = 2
-ID_S1 = 3
-ID_S2 = 4
+ID_REF_PATH = 2 # Place at far end of track (Horizontal reference)
+ID_S1 = 3       # Start of Braking Zone
+ID_S2 = 4       # End of Braking Zone
 
 # Thresholds
 SPEED_MIN = 1.0
@@ -53,33 +53,26 @@ EMERGENCY_TIME_LIMIT = 5.0 # Seconds
 # HARDWARE INITIALIZATION
 # ==========================================
 
-# GPIO Setup
 GPIO.setmode(GPIO.BCM)
 GPIO.setup([BTN_SPEED, BTN_PATH, BTN_EMERGENCY, BTN_BRAKE], GPIO.IN, pull_up_down=GPIO.PUD_UP)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
 
-# Servo PWM
 pwm_servo = GPIO.PWM(SERVO_PIN, SERVO_FREQ)
 pwm_servo.start(0)
 
-# I2C Setup (LCD and ToF share the bus)
 try:
-    # Initialize LCD (Address usually 0x27)
     lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8)
     lcd.clear()
     
-    # Initialize ToF Sensor
     i2c = busio.I2C(board.SCL, board.SDA)
     tof = adafruit_vl53l0x.VL53L0X(i2c)
 except Exception as e:
     print(f"I2C Init Error: {e}")
 
-# Camera Setup
 cap = cv2.VideoCapture(0)
 cap.set(3, CAM_WIDTH)
 cap.set(4, CAM_HEIGHT)
 
-# AruCo Setup
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
 aruco_params = aruco.DetectorParameters()
 
@@ -88,7 +81,6 @@ aruco_params = aruco.DetectorParameters()
 # ==========================================
 
 def display_lcd(line1, line2=""):
-    """Writes text to LCD."""
     lcd.clear()
     lcd.write_string(line1)
     lcd.crlf()
@@ -96,14 +88,12 @@ def display_lcd(line1, line2=""):
     print(f"[LCD] {line1} | {line2}")
 
 def set_servo(angle):
-    """0 = Open, 90 = Obstacle."""
     dc = SERVO_OPEN_DC if angle == 0 else SERVO_CLOSE_DC
     pwm_servo.ChangeDutyCycle(dc)
     time.sleep(0.5)
-    pwm_servo.ChangeDutyCycle(0) # Stop jitter
+    pwm_servo.ChangeDutyCycle(0)
 
 def send_data(test_name, result_data, status):
-    """Sends JSON data to server."""
     payload = {
         "session_id": f"{test_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         "timestamp": datetime.now().isoformat(),
@@ -111,13 +101,12 @@ def send_data(test_name, result_data, status):
         "status": status
     }
     try:
-        # response = requests.post(IOT_SERVER_URL, json=payload, timeout=2) # Uncomment for real server
+        # requests.post(IOT_SERVER_URL, json=payload, timeout=2) 
         print(f"Uploading: {payload}")
     except Exception as e:
         print(f"Upload Failed: {e}")
 
 def get_aruco_positions(frame):
-    """Returns a dict of found AruCo IDs and their centers (x, y)."""
     corners, ids, _ = aruco.detectMarkers(frame, aruco_dict, parameters=aruco_params)
     positions = {}
     if ids is not None:
@@ -131,10 +120,11 @@ def get_aruco_positions(frame):
     return positions
 
 # ==========================================
-# TEST LOGIC FUNCTIONS
+# UPDATED TEST LOGIC
 # ==========================================
 
 def test_speed():
+    # Speed test uses Euclidean distance, so it works on X or Y axis automatically.
     display_lcd("Speed Test", "Ready...")
     time.sleep(2)
     
@@ -144,7 +134,6 @@ def test_speed():
     
     start_time = time.time()
     
-    # Run test for 5 seconds
     while time.time() - start_time < 5:
         ret, frame = cap.read()
         if not ret: continue
@@ -156,7 +145,6 @@ def test_speed():
             curr_time = time.time()
             
             if positions_prev is not None:
-                # Calculate Euclidean distance in pixels
                 dist_px = math.sqrt((curr_pos[0]-positions_prev[0])**2 + (curr_pos[1]-positions_prev[1])**2)
                 dist_m = dist_px / PIXELS_PER_METER
                 dt = curr_time - time_prev
@@ -164,7 +152,7 @@ def test_speed():
                 if dt > 0:
                     speed = dist_m / dt
                     speeds.append(speed)
-                    print(f"Current Speed: {speed:.2f} m/s")
+                    print(f"Speed: {speed:.2f}")
             
             positions_prev = curr_pos
             time_prev = curr_time
@@ -178,25 +166,31 @@ def test_speed():
         display_lcd("Error", "No Marker Found")
 
 def test_path_accuracy():
+    # UPDATED: Calculates angle relative to Horizontal (Side View)
     display_lcd("Path Acc Test", "Finding Refs...")
     time.sleep(1)
     
     ret, frame = cap.read()
     positions = get_aruco_positions(frame)
     
-    if ID_ROBOT in positions and ID_PATH_REF in positions:
+    if ID_ROBOT in positions and ID_REF_PATH in positions:
         p1 = positions[ID_ROBOT]
-        p2 = positions[ID_PATH_REF] # Middle of track
+        p2 = positions[ID_REF_PATH] # Reference at end of track
         
-        # Calculate angle of line connecting Robot and Ref relative to vertical
         dx = p2[0] - p1[0]
         dy = p2[1] - p1[1]
         
-        # Angle in degrees. 0 degrees is strictly vertical movement
-        angle_rad = math.atan2(dx, dy) 
+        # Calculate angle of line connecting Robot and Ref
+        angle_rad = math.atan2(dy, dx) 
         angle_deg = math.degrees(angle_rad)
-        deviation = abs(angle_deg)
         
+        # We want flatness (horizontal). 
+        # Ideally angle is 0 (right) or 180 (left).
+        # We take deviation from the nearest horizontal axis.
+        deviation = abs(angle_deg)
+        if deviation > 90:
+            deviation = abs(180 - deviation)
+            
         status = "Pass" if deviation < PATH_MAX_DEVIATION else "Fail"
         
         display_lcd(f"Dev: {deviation:.1f} deg", status)
@@ -205,18 +199,14 @@ def test_path_accuracy():
         display_lcd("Error", "Mkrs Missing")
 
 def test_emergency_brake():
-    # Ensure servo is open
+    # Same as before (ToF sensor logic is axis-independent)
     set_servo(0)
     display_lcd("Emg Brake Test", "Running...")
-    
-    # Random wait 2 to 5 seconds
     time.sleep(np.random.uniform(2, 5))
     
-    # Trigger Obstacle
     set_servo(90)
     trigger_time = time.time()
     
-    # Monitor ToF for stop
     history = []
     stop_time = 0
     robot_stopped = False
@@ -227,15 +217,13 @@ def test_emergency_brake():
             history.append(dist)
             if len(history) > 5: history.pop(0)
             
-            # Check if distance is constant (variance is low)
-            if len(history) == 5 and max(history) - min(history) < 10: # 10mm tolerance
+            if len(history) == 5 and max(history) - min(history) < 10:
                 robot_stopped = True
                 stop_time = time.time() - trigger_time
         except:
             pass
         time.sleep(0.1)
 
-    # Reset Servo
     set_servo(0)
     
     if robot_stopped:
@@ -243,13 +231,14 @@ def test_emergency_brake():
         display_lcd(f"Stop: {stop_time:.2f}s", status)
         send_data("Emg_Brake", {"stop_time": stop_time}, status)
     else:
-        display_lcd("Fail", "No Stop Detect")
+        display_lcd("Fail", "No Stop")
         send_data("Emg_Brake", {"stop_time": -1}, "Fail")
 
 def test_brake_zone():
+    # UPDATED: Uses X-Axis logic (Side View)
     display_lcd("Brake Zone Test", "Wait for Stop...")
     
-    # 1. Capture Reference positions first
+    # 1. Capture Reference X positions
     ret, frame = cap.read()
     positions = get_aruco_positions(frame)
     
@@ -257,51 +246,48 @@ def test_brake_zone():
         display_lcd("Error", "Zones Missing")
         return
 
-    # Assume S1 is first line (lower Y pixel value if top-down view?), S2 is second
-    # Adjust logic based on your camera orientation.
-    # Here assuming Robot moves from Top of image (low Y) to Bottom (High Y)
-    y_s1 = positions[ID_S1][1]
-    y_s2 = positions[ID_S2][1]
+    # Sort X coordinates to define Left/Right limits regardless of placement
+    x_coords = sorted([positions[ID_S1][0], positions[ID_S2][0]])
+    limit_left = x_coords[0]
+    limit_right = x_coords[1]
     
     # 2. Wait for robot to stop moving
     last_pos = (0,0)
     stable_count = 0
     
-    while stable_count < 10: # wait for 10 frames of no movement
+    while stable_count < 10: 
         ret, frame = cap.read()
         positions = get_aruco_positions(frame)
         if ID_ROBOT in positions:
             curr_pos = positions[ID_ROBOT]
             dist = math.sqrt((curr_pos[0]-last_pos[0])**2 + (curr_pos[1]-last_pos[1])**2)
             
-            if dist < 2: # barely moved
+            if dist < 3: # increased threshold slightly for noise
                 stable_count += 1
             else:
                 stable_count = 0
             last_pos = curr_pos
         time.sleep(0.1)
         
-    # 3. Check position
-    robot_y = last_pos[1]
-    
-    # Logic: Start -> S1 -> S2 -> End
-    # Pass if S1 < Robot < S2
+    # 3. Check X position
+    robot_x = last_pos[0]
     
     status = ""
     res_text = ""
     
-    if robot_y < y_s1:
-        status = "Fail (Over)" # Stopped too early
-        res_text = "Overbrake"
-    elif robot_y > y_s2:
-        status = "Fail (Under)" # Stopped too late
-        res_text = "Underbrake"
-    else:
+    # Check if robot X is between limits
+    if limit_left < robot_x < limit_right:
         status = "Pass"
         res_text = "Good Stop"
+    else:
+        status = "Fail"
+        if robot_x < limit_left:
+            res_text = "Left of Zone"
+        else:
+            res_text = "Right of Zone"
         
     display_lcd(res_text, status)
-    send_data("Brake_Zone", {"position_y": robot_y, "s1": y_s1, "s2": y_s2}, status)
+    send_data("Brake_Zone", {"pos_x": robot_x, "lim_l": limit_left, "lim_r": limit_right}, status)
 
 # ==========================================
 # MAIN LOOP
